@@ -1,0 +1,165 @@
+# Hardened QEMU s390x release workflow for rke2-runtime.
+#
+# rke2-runtime is an ASSEMBLY image (FROM scratch, COPY binaries from pinned hardened-* component
+# images + a `charts` stage) — NOT a FROM-base consumer. For s390x we redirect the Dockerfile's
+# `rancher/hardened-*` FROM pins to `ghcr.io/<owner>/hardened-*` (which carry s390x legs we publish),
+# build the `runtime` target under QEMU, then combine with the upstream amd64/arm64 legs (pinned BY
+# DIGEST) into one published manifest. Checks out the EXACT tag — component pins differ per release.
+#
+# The published/combined tag is the dockerized form (v1.33.12+rke2r2 -> v1.33.12-rke2r2), matching the
+# upstream rancher/rke2-runtime tag form.
+#
+# Hardening: dynamic upstream legs · digest-pinned upstream pulls · immutable combined tag
+# (force=true to overwrite) · workflow_dispatch-only · no GitHub Release job.
+name: Release s390x
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "rke2 release tag (e.g., v1.33.12+rke2r2)"
+        required: true
+        type: string
+      force:
+        description: "Overwrite the combined tag if it already exists (treat as immutable otherwise)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/rke2-runtime
+  UPSTREAM_IMAGE: rancher/rke2-runtime
+
+jobs:
+  build-s390x:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.ver.outputs.image_tag }}
+    steps:
+      - name: Checkout (exact tag — tag-specific component pins)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Resolve versions
+        id: ver
+        env:
+          TAG: ${{ inputs.tag }}        # via env, never inlined into the shell (injection-safe)
+        run: |
+          set -euo pipefail
+          DOCKERIZED="${TAG//+/-}"                 # v1.33.12+rke2r2 -> v1.33.12-rke2r2
+          KVER="${TAG%%+*}"                        # v1.33.12 (k8s version embedded in the rke2 tag)
+          MAJOR="$(printf '%s' "$TAG" | sed -E 's/^v([0-9]+)\..*/\1/')"
+          MINOR="$(printf '%s' "$TAG" | sed -E 's/^v[0-9]+\.([0-9]+)\..*/\1/')"
+          {
+            echo "version=$TAG"
+            echo "image_tag=$DOCKERIZED"
+            echo "kubernetes_version=$KVER"
+            echo "major=$MAJOR"
+            echo "minor=$MINOR"
+          } >> "$GITHUB_OUTPUT"
+          echo "VERSION=$TAG DOCKERIZED=$DOCKERIZED K8S=$KVER MAJOR=$MAJOR MINOR=$MINOR"
+
+      # The runtime image COPYs binaries from rancher/hardened-{build-base,containerd,crictl,runc,
+      # kubernetes}. Those upstream images have no s390x leg; repoint them to our published s390x
+      # variants so buildx pulls the s390x leg for each FROM under linux/s390x.
+      - name: Redirect hardened component pins to dnse-tech s390x images
+        env:
+          REG: ${{ env.REGISTRY }}/${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          sed -i "s#rancher/hardened-#${REG}/hardened-#g" Dockerfile
+          echo "Redirected FROM pins:"; grep -E '^FROM .*/hardened-' Dockerfile
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push s390x runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/s390x
+          push: true
+          target: runtime
+          build-args: |
+            TAG=${{ steps.ver.outputs.version }}
+            KUBERNETES_VERSION=${{ steps.ver.outputs.kubernetes_version }}
+            MAJOR=${{ steps.ver.outputs.major }}
+            MINOR=${{ steps.ver.outputs.minor }}
+            BUILDARCH=s390x
+            CACHEBUST=${{ github.run_id }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.image_tag }}-s390x
+
+  create-manifest:
+    runs-on: ubuntu-latest
+    needs: build-s390x
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to clobber an existing combined tag unless force
+        env:
+          TAG: ${{ needs.build-s390x.outputs.image_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG"
+          if docker buildx imagetools inspect "$IMG" >/dev/null 2>&1; then
+            if [ "$FORCE" != "true" ]; then
+              echo "::error::$IMG already exists and force=false (tags are immutable). Re-run with force=true to overwrite."
+              exit 1
+            fi
+            echo "::warning::$IMG exists; force=true → overwriting."
+          fi
+
+      # Combine the s390x leg with the upstream legs referenced DIRECTLY by digest — imagetools copies
+      # the digest-pinned upstream manifests into the target repo, so published per-arch digests match.
+      - name: Create and push multi-arch manifest (digest-pinned legs)
+        env:
+          TAG: ${{ needs.build-s390x.outputs.image_tag }}
+          UP: ${{ env.UPSTREAM_IMAGE }}
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          RAW="$(docker buildx imagetools inspect --raw "$UP:$TAG")"
+          mapfile -t LEGS < <(echo "$RAW" | jq -r --arg up "$UP" '.manifests[]
+            | select(.platform.os=="linux" and .platform.architecture!="unknown")
+            | "\($up)@\(.digest)"')
+          if [ "${#LEGS[@]}" -eq 0 ]; then
+            echo "::error::no real linux upstream legs detected for $UP:$TAG — refusing to publish s390x-only"
+            exit 1
+          fi
+          echo "upstream legs:"; printf '  %s\n' "${LEGS[@]}"
+          docker buildx imagetools create -t "$IMG:$TAG" "$IMG:$TAG-s390x" "${LEGS[@]}"
+          echo "Created: $IMG:$TAG"
+
+      - name: Verify manifest
+        env:
+          TAG: ${{ needs.build-s390x.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          docker buildx imagetools inspect "$IMG:$TAG"
+          docker buildx imagetools inspect --raw "$IMG:$TAG" \
+            | jq -e '[.manifests[].platform.architecture] | index("s390x") != null' >/dev/null \
+            || { echo "::error::s390x leg missing from combined manifest"; exit 1; }
