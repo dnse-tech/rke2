@@ -1,9 +1,12 @@
 # Build rke2 s390x install assets and publish to a fork Release, for system-agent-installer-rke2.
 # Upstream rke2 ships no s390x install tarball; the installer's scripts/download (redirected to this
 # fork) needs: rke2.linux-s390x.tar.gz + rke2-images-core.linux-s390x.txt + sha256sum-s390x.txt.
-# Built natively on s390x (rke2 is a heavy build; QEMU on X64 is unstable) inside the same
-# hardened-build-base the rke2 Dockerfile uses. boringcrypto disabled (unsupported on s390x).
-# Image refs baked to ghcr.io/dnse-tech so s390x nodes pull images that have s390x legs.
+#
+# SPLIT by necessity: the rke2 Go build is too heavy for QEMU on X64 (Go internal compiler error /
+# nil-pointer = emulation bug) so it MUST run on a NATIVE s390x runner; but `gh` is only on the X64
+# ubuntu-24.04 pool. So: build-s390x (native) produces the assets as a workflow artifact, then
+# release (X64, has gh) downloads + uploads them to the fork Release.
+# boringcrypto disabled (unsupported on s390x); image refs baked to ghcr.io/dnse-tech.
 name: Release s390x install assets
 
 on:
@@ -22,30 +25,26 @@ env:
   DOCKER_CONTEXT: default
 
 jobs:
-  assets-s390x:
-    runs-on: [self-hosted, X64, 'os:ubuntu-24.04']
+  build-s390x:
+    runs-on: [self-hosted, Linux, s390x]
     steps:
       - name: Checkout exact tag
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0          # version.sh uses git describe / tag --contains
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: linux/s390x
       - name: Login to GHCR (pull build-base)
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build rke2 s390x binary + bundle + asset list
+      - name: Build rke2 s390x binary + bundle + asset list (native, no QEMU)
         run: |
           set -euxo pipefail
           # s390x can't use boringcrypto (only asserted for amd64 anyway)
           sed -i 's/GOEXPERIMENT=boringcrypto go build/GOEXPERIMENT= go build/' scripts/build-binary
-          docker run --rm --platform linux/s390x \
+          docker run --rm \
             -v "$PWD:/src" -w /src \
             -e ARCH=s390x -e GOARCH=s390x -e GOOS=linux \
             -e REGISTRY=ghcr.io -e REPO=dnse-tech \
@@ -61,18 +60,39 @@ jobs:
               cp build/images-core.txt dist/artifacts/rke2-images-core.linux-s390x.txt
               ./scripts/checksum
               echo "=== artifacts ==="; ls -la dist/artifacts/
-              echo "=== sha file ==="; cat dist/artifacts/sha256sum-s390x.txt
+              cat dist/artifacts/sha256sum-s390x.txt
             '
-      - name: Upload assets to fork Release
+      - name: Upload assets as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rke2-s390x-assets
+          path: |
+            dist/artifacts/rke2.linux-s390x.tar.gz
+            dist/artifacts/rke2-images-core.linux-s390x.txt
+            dist/artifacts/sha256sum-s390x.txt
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    needs: build-s390x
+    runs-on: [self-hosted, X64, 'os:ubuntu-24.04']   # has gh; upload only (no s390x build)
+    steps:
+      - name: Download s390x assets
+        uses: actions/download-artifact@v4
+        with:
+          name: rke2-s390x-assets
+          path: assets
+      - name: Upload to fork Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
         run: |
           set -euxo pipefail
+          ls -la assets
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "s390x install assets (linux/s390x)"
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            dist/artifacts/rke2.linux-s390x.tar.gz \
-            dist/artifacts/rke2-images-core.linux-s390x.txt \
-            dist/artifacts/sha256sum-s390x.txt
+            assets/rke2.linux-s390x.tar.gz \
+            assets/rke2-images-core.linux-s390x.txt \
+            assets/sha256sum-s390x.txt
           echo "Uploaded s390x install assets to release $TAG"
