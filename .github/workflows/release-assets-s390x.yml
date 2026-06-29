@@ -28,6 +28,8 @@ jobs:
   build-s390x:
     runs-on: [self-hosted, Linux, s390x]
     steps:
+      - name: Clean root-owned leftovers from prior runs (docker writes as root → breaks git clean)
+        run: docker run --rm -v "$PWD:/w" -w /w busybox rm -rf bin dist build 2>/dev/null || true
       - name: Checkout exact tag
         uses: actions/checkout@v4
         with:
